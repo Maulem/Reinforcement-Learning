@@ -1,10 +1,10 @@
 import gym
-import time
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-import sys
+
 import math
 import random
 from collections import namedtuple, deque
@@ -12,7 +12,9 @@ from itertools import count
 import matplotlib
 import matplotlib.pyplot as plt
 import statistics
-import threading
+
+
+from DDQLTests import renderCartpole, renderLunarLander, multipleTestLunarLander, MemoryThread, killSwitch
 
 ###| DEFINES |###
     
@@ -25,37 +27,8 @@ IS_IPYTHON = 'inline' in matplotlib.get_backend()
 if IS_IPYTHON:
     from IPython import display
 
-killSwitch = False
 
 ###| CORE |###
-
-# Thread that can save the return of the function in self.value
-class MemoryThread(threading.Thread):
-    # constructor
-    def __init__(self, group=None, target=None, name=None,
-                 args=(), kwargs=None, *, daemon=None):
-        # execute the base constructor
-        threading.Thread.__init__(self, group, target, name,
-                 args, kwargs)
-        # set a default value
-        self.value = None
- 
-    def run(self):
-        """Method representing the thread's activity.
-
-        You may override this method in a subclass. The standard run() method
-        invokes the callable object passed to the object's constructor as the
-        target argument, if any, with sequential and keyword arguments taken
-        from the args and kwargs arguments, respectively.
-
-        """
-        try:
-            if self._target:
-                self.value = self._target(*self._args, **self._kwargs)
-        finally:
-            # Avoid a refcycle if the thread is running a function with
-            # an argument that has a member that points to the thread.
-            del self._target, self._args, self._kwargs
     
 class DoubleDeepQLearning():
 
@@ -74,39 +47,41 @@ class DoubleDeepQLearning():
         def __len__(self):
             return len(self.memory)
         
-    class DQN(nn.Module):
+    # class DQN(nn.Module):
 
-        def __init__(self, n_observations, n_actions):
-            super(DoubleDeepQLearning.DQN, self).__init__()
-            self.layer1 = nn.Linear(n_observations, 512)
-            self.layer2 = nn.Linear(512, 256)
-            self.layer3 = nn.Linear(256, 128)
-            self.layer4 = nn.Linear(128, 64)
-            self.layer5 = nn.Linear(64, n_actions)
+    #     def __init__(self, n_observations, n_actions):
+    #         super(DoubleDeepQLearning.DQN, self).__init__()
+    #         self.layer1 = nn.Linear(n_observations, 512)
+    #         self.layer2 = nn.Linear(512, 256)
+    #         self.layer3 = nn.Linear(256, 128)
+    #         self.layer4 = nn.Linear(128, 64)
+    #         self.layer5 = nn.Linear(64, n_actions)
 
-        # Called with either one element to determine next action, or a batch
-        # during optimization. Returns tensor([[left0exp,right0exp]...]).
-        def forward(self, x):
-            x = F.relu(self.layer1(x))
-            x = F.relu(self.layer2(x))
-            x = F.relu(self.layer3(x))
-            x = F.relu(self.layer4(x))
-            return self.layer5(x)
+    #     # Called with either one element to determine next action, or a batch
+    #     # during optimization. Returns tensor([[left0exp,right0exp]...]).
+    #     def forward(self, x):
+    #         x = F.relu(self.layer1(x))
+    #         x = F.relu(self.layer2(x))
+    #         x = F.relu(self.layer3(x))
+    #         x = F.relu(self.layer4(x))
+    #         return self.layer5(x)
     
-    def __init__(self, env, gamma, epsilon, epsilon_min, epsilon_dec, batch_size, tau, lr, num_episodes, arqName):
+    def __init__(self, env, neuralNetwork, gamma, epsilon, epsilon_min, epsilon_dec, batch_size, tau, lr, num_episodes, stop, arqName):
 
         # Turn plt interactive mode on
         plt.ion()
 
         self.env = env
-        self.gamma = gamma              # gamma is the discount factor as mentioned in the previous section
-        self.epsilon = epsilon          # epsilon is the starting value of epsilon
-        self.epsilon_min = epsilon_min  # epsilon_min is the final value of epsilon
-        self.epsilon_dec = epsilon_dec  # epsilon_dec controls the rate of exponential decay of epsilon, higher means a slower decay
-        self.batch_size = batch_size    # batch_size is the number of transitions sampled from the replay buffer
-        self.tau = tau                  # tau is the update rate of the target network
-        self.lr = lr                    # lr is the learning rate of the ``AdamW`` optimizer
+        self.neuralNetwork = neuralNetwork
+        self.gamma = gamma                  # gamma is the discount factor as mentioned in the previous section
+        self.epsilon = epsilon              # epsilon is the starting value of epsilon
+        self.epsilon_min = epsilon_min      # epsilon_min is the final value of epsilon
+        self.epsilon_dec = epsilon_dec      # epsilon_dec controls the rate of exponential decay of epsilon, higher means a slower decay
+        self.batch_size = batch_size        # batch_size is the number of transitions sampled from the replay buffer
+        self.tau = tau                      # tau is the update rate of the target network
+        self.lr = lr                        # lr is the learning rate of the ``AdamW`` optimizer
         self.num_episodes = num_episodes
+        self.stop = stop
         self.arqName = arqName
         self.episode_durations = []
         self.rewards = []
@@ -129,10 +104,10 @@ class DoubleDeepQLearning():
             DEVICE = torch.device("cpu")
 
         # Create the policy neural network
-        self.policy_net = self.DQN(n_observations, n_actions).to(DEVICE)
+        self.policy_net = self.neuralNetwork(n_observations, n_actions).to(DEVICE)
 
         # Create and copy the target neural network from the policy neural network
-        self.target_net = self.DQN(n_observations, n_actions).to(DEVICE)
+        self.target_net = self.neuralNetwork(n_observations, n_actions).to(DEVICE)
         self.target_net.load_state_dict(self.policy_net.state_dict())
 
         # Set the optimizer 
@@ -299,30 +274,33 @@ class DoubleDeepQLearning():
                 goodEpsCount = 0
 
             if i_episode % 50 == 0:
-                torch.save(self.policy_net.state_dict(), self.arqName + "Policy")
-                torch.save(self.target_net.state_dict(), self.arqName + "Target")
+                torch.save(self.policy_net.state_dict(), str(self.arqName) + "Policy")
+                torch.save(self.target_net.state_dict(), str(self.arqName) + "Target")
                 if self.env.spec.id == "LunarLander-v2":
                     if threadTest is not None:
                         if threadTest.is_alive():
                             killSwitch = True
                             threadTest.join()
-                    threadTest = MemoryThread(target = renderLunarLander, args = (self.arqName + "Policy", ))
+                    threadTest = MemoryThread(target = renderLunarLander, args = (self.neuralNetwork, self.arqName + "Policy", ))
                     threadTest.start()
                     testTimes = 100
                     threads =  100
-                    _rewards, goodCount = multipleTestLunarLander(testTimes, threads, fileName = self.arqName + "Policy")
+                    _rewards, goodCount = multipleTestLunarLander(testTimes, threads, self.neuralNetwork, self.arqName + "Policy")
                     accuracy = goodCount/testTimes * 100
                     print("Tested accuracy from {0} is {1}%".format(self.arqName, accuracy))
-                    if goodCount > int(0.98 * testTimes): break
+                    if goodCount > int(self.stop * testTimes): break
+
                 elif self.env.spec.id == "CartPole-v1":
                     if threadTest is not None:
                         if threadTest.is_alive():
+                            print("Killed")
                             killSwitch = True
                             threadTest.join()
-                    threadTest = MemoryThread(target = renderCartpole, args = (self.arqName + "Policy", ))
+                    if goodEpsCount >= self.stop: break
+                    threadTest = MemoryThread(target = renderCartpole, args = (self.neuralNetwork, self.arqName + "Policy", ))
                     threadTest.start()
                     accuracy = 100
-                    if goodEpsCount >= 50: break
+                    
 
 
         print("Complete {0} with {1}% accuracy".format(self.arqName, accuracy))
@@ -331,213 +309,10 @@ class DoubleDeepQLearning():
 
         torch.save(self.policy_net.state_dict(), self.arqName + "Policy")
         torch.save(self.target_net.state_dict(), self.arqName + "Target")
-
-        if threadTest is not None:
-            if threadTest.is_alive():
-                killSwitch = True
-                threadTest.join()
         
         if self.env.spec.id == "LunarLander-v2":
             plt.savefig("results/lunarLander/DDQL.png")
         elif self.env.spec.id == "CartPole-v1":
             plt.savefig("results/cartPole/DDQL.png")
+
         return accuracy
-    
-def renderCartpole(path = "data/model_test_policy"):
-
-    global killSwitch
-
-    def nextAction(state):
-        with torch.no_grad():
-            # t.max(1) will return the largest column value of each row.
-            # second column on max result is index of where max element was
-            # found, so we pick action with the larger expected reward.
-            return policy_net(state).max(1)[1].view(1, 1).item()
-        
-    # Create the enviroment in human render mode
-    env = gym.make('CartPole-v1', render_mode="human")
-
-    # Get number of actions from gym action space
-    n_actions = env.action_space.n
-
-    # Get the number of state observations
-    observation, info = env.reset()
-    n_observations = len(observation)
-
-    # If GPU is to be used
-    #DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Loads the neural network to test
-    policy_net = DoubleDeepQLearning.DQN(n_observations, n_actions).to(DEVICE)
-    policy_net.load_state_dict(torch.load(path))
-
-    # Returns an initial state
-    state = torch.tensor(observation, dtype=torch.float32, device = DEVICE).unsqueeze(0)
-
-    # Starts the loop
-    done = False
-
-    startTime = time.time()
-    lastTime = -1
-
-    while not done:
-
-        env.render()
-
-        # The neural network produces either 0 (left) or 1 (right).
-        observation, reward, terminated, truncated, _ = env.step(nextAction(state))
-
-        if terminated:
-            state = None
-        else:
-            state = torch.tensor(observation, dtype=torch.float32, device = DEVICE).unsqueeze(0)
-
-        nowTime = time.time()
-
-        if int(nowTime - startTime) > lastTime:
-            sys.stdout.write("                                 " + '\r')
-            sys.stdout.flush()
-            sys.stdout.write("O cartpole esta em pé a {} segundos.".format(int(nowTime - startTime)))
-            sys.stdout.flush()
-            lastTime = int(nowTime - startTime)
-
-        if terminated or killSwitch:
-            killSwitch = False
-            done = True
-
-    env.close()
-
-def renderLunarLander(path = "data/model_test_policy"):
-    def nextAction(state):
-        with torch.no_grad():
-            # t.max(1) will return the largest column value of each row.
-            # second column on max result is index of where max element was
-            # found, so we pick action with the larger expected reward.
-            return policy_net(state).max(1)[1].view(1, 1).item()
-
-    env = gym.make('LunarLander-v2', render_mode='human').env
-
-    global killSwitch
-
-    # Get number of actions from gym action space
-    n_actions = env.action_space.n
-
-    # Get the number of state observations
-    observation, info = env.reset()
-    n_observations = len(observation)
-
-    # Loads the neural network to test
-    policy_net = DoubleDeepQLearning.DQN(n_observations, n_actions).to(DEVICE)
-    policy_net.load_state_dict(torch.load(path))
-
-    # Returns an initial state
-    state = torch.tensor(observation, dtype=torch.float32, device = DEVICE).unsqueeze(0)
-
-    # Starts the loop
-    done = False
-
-    rewards = 0
-    steps = 0
-    max_steps = 500
-
-    while (not done) and (steps < max_steps):
-
-        # The neural network produces either 0 (left) or 1 (right).
-        observation, reward, terminated, truncated, _ = env.step(nextAction(state))
-
-        if terminated:
-            state = None
-        else:
-            state = torch.tensor(observation, dtype=torch.float32, device = DEVICE).unsqueeze(0)
-
-
-        rewards += reward
-        env.render()
-        steps += 1
-
-        if terminated or killSwitch:
-            killSwitch = False
-            done = True
-
-
-
-    print(f'Score = {rewards}')
-
-    env.close()
-
-
-def testLunarLander(fileName = "data/lunarLander/98%_policy"):
-    def nextAction(state):
-        with torch.no_grad():
-            # t.max(1) will return the largest column value of each row.
-            # second column on max result is index of where max element was
-            # found, so we pick action with the larger expected reward.
-            return policy_net(state).max(1)[1].view(1, 1).item()
-
-    env = gym.make('LunarLander-v2').env
-
-    # Get number of actions from gym action space
-    n_actions = env.action_space.n
-
-    # Get the number of state observations
-    observation, info = env.reset()
-    n_observations = len(observation)
-
-    # Loads the neural network to test
-    policy_net = DoubleDeepQLearning.DQN(n_observations, n_actions).to(DEVICE)
-    policy_net.load_state_dict(torch.load(fileName))
-
-    # Returns an initial state
-    state = torch.tensor(observation, dtype=torch.float32, device = DEVICE).unsqueeze(0)
-
-    # Starts the loop
-    done = False
-
-    rewards = 0
-    steps = 0
-    max_steps = 500
-
-    while (not done) and (steps < max_steps):
-
-        # The neural network produces either 0 (left) or 1 (right).
-        observation, reward, terminated, truncated, _ = env.step(nextAction(state))
-
-        if terminated:
-            state = None
-        else:
-            state = torch.tensor(observation, dtype=torch.float32, device = DEVICE).unsqueeze(0)
-
-
-        rewards += reward
-
-        steps += 1
-
-        if terminated: 
-            done = True
-
-    env.close()
-
-    return rewards
-
-def multipleTestLunarLander(times, maxThreads, verbose = False, fileName = "data/lunarLander/98%_policy"):
-    rewards = []
-    goodCount = 0
-
-    if times < maxThreads:
-        maxThreads = times
-    
-    for _ in range(int(times / maxThreads)):
-        threads = list()
-        for index in range(maxThreads):
-            x = MemoryThread(target=testLunarLander, args=(fileName, ))
-            threads.append(x)
-            x.start()
-
-        for index, thread in enumerate(threads):
-            thread.join()
-            rewards.append(thread.value)
-            if verbose:
-                print(f'Score = {thread.value}')
-            if thread.value >= 200:
-                goodCount += 1
-    return rewards, goodCount

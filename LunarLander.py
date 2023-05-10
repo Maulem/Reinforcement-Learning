@@ -1,38 +1,37 @@
 import gym
-import matplotlib.pyplot as plt
-import numpy as np
-from collections import deque
-from DDQLPytorch import DoubleDeepQLearning, renderLunarLander, multipleTestLunarLander, MemoryThread
+from DDQLPytorch import DoubleDeepQLearning
 from multiprocessing import Process, Pipe
 from statistics import mean
+from NeuralNetworks import LunarLanderNeuralNetwork
+from DDQLTests import renderLunarLander, multipleTestLunarLander, MemoryThread
 
-gamma = 0.99 
-epsilon = 0.9
-epsilon_min = 0.01
-epsilon_dec = 1000
-episodes = 2000
-batch_size = 128
-tau = 0.005         # TAU is the update rate of the target network
-lr = 1e-4           # LR is the learning rate of the ``AdamW`` optimizer
+###|CONSTANTS|###
 
-def trainLunarLander(arqName, conn):
-    newEnv = gym.make('LunarLander-v2')
-    print("hello from: " + arqName)
-    DDQL = DoubleDeepQLearning(newEnv, gamma, epsilon, epsilon_min, epsilon_dec, batch_size, tau, lr, episodes, arqName)
+GAMMA = 0.99        # GAMMA is the discount factor as mentioned in the previous section
+EPSILON = 0.9       # EPSILON is the starting value of epsilon
+EPSILON_MIN = 0.01  # EPSILON_MIN is the final value of epsilon
+EPSILON_DEC = 1000  # EPSILON_DEC controls the rate of exponential decay of epsilon, higher means a slower decay
+BATCH_SIZE = 128    # BATCH_SIZE is the number of transitions sampled from the replay buffer
+TAU = 0.005         # TAU is the update rate of the target network
+LR = 1e-4           # LR is the learning rate of the ``AdamW`` optimizer
+NUM_EPISODES = 2000
+STOP = 0.98
+FILENAME = "data/lunarLander/lunarLander"
+MAX_THREADS = 100
+
+def trainLunarLander(LunarLanderNetwork, fileName, conn):
+    print("hello from: " + fileName)
+    env = gym.make('LunarLander-v2')
+    DDQL = DoubleDeepQLearning( env, LunarLanderNetwork, GAMMA, EPSILON, EPSILON_MIN, EPSILON_DEC,
+                                BATCH_SIZE, TAU, LR, NUM_EPISODES, STOP, fileName)
     accuracy = DDQL.train()
     conn.send(accuracy)
     conn.close()
 
 if __name__ == "__main__":
+    
+    LunarLanderNetwork = LunarLanderNeuralNetwork
 
-    #env = gym.make('LunarLander-v2',render_mode="human")
-    env = gym.make('LunarLander-v2')
-    #np.random.seed(0)
-
-    print('State space: ', env.observation_space)
-    print('Action space: ', env.action_space)
-
-    # train = False
     print("Choose which mode to run:")
     print("1 - Train the model")
     print("3 - Test the last model performance")
@@ -48,8 +47,8 @@ if __name__ == "__main__":
 
             for index in range(2):
                 parent_conn, child_conn = Pipe()
-                arqName = "data/lunarLander/lunarLander" + str(index)
-                x = Process(target=trainLunarLander, args=(arqName, child_conn,))
+                arqName = FILENAME + str(index)
+                x = Process(target = trainLunarLander, args=(LunarLanderNetwork, arqName, child_conn, ))
                 processes.append((x, parent_conn))
                 x.start()
 
@@ -73,12 +72,12 @@ if __name__ == "__main__":
         print("Insert the number of times to test")
         times = int(input())
 
-        fileName = "data/lunarLander/lunarLander0Policy"
+        fileName = FILENAME + "0Policy"
 
-        threadTest = MemoryThread(target = renderLunarLander, args = (fileName, ))
+        threadTest = MemoryThread(target = renderLunarLander, args = (LunarLanderNetwork, fileName, ))
         threadTest.start()
 
-        rewards, goodCount = multipleTestLunarLander(times, 100, verbose = True, fileName = fileName)
+        rewards, goodCount = multipleTestLunarLander(times, MAX_THREADS, LunarLanderNetwork, fileName, verbose = True)
 
         print("Rewards mean: {} points".format(mean(rewards)))
         print("Good rewards rate: {0}/{1} or {2}%".format(goodCount, times, goodCount/times * 100))
@@ -89,10 +88,10 @@ if __name__ == "__main__":
 
         fileName = "data/lunarLander/bestPolicy"
 
-        threadTest = MemoryThread(target = renderLunarLander, args = (fileName, ))
+        threadTest = MemoryThread(target = renderLunarLander, args = (LunarLanderNetwork, fileName, ))
         threadTest.start()
 
-        rewards, goodCount = multipleTestLunarLander(times, 100, verbose = True, fileName = fileName)
+        rewards, goodCount = multipleTestLunarLander(times, MAX_THREADS, LunarLanderNetwork, fileName, verbose = True)
 
         print("Rewards mean: {} points".format(mean(rewards)))
         print("Good rewards rate: {0}/{1} or {2}%".format(goodCount, times, goodCount/times * 100))
