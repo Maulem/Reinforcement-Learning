@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-
+import numpy
 import math
 import random
 from collections import namedtuple, deque
@@ -300,6 +300,246 @@ class DoubleDeepQLearning():
                     threadTest = MemoryThread(target = renderCartpole, args = (self.neuralNetwork, self.arqName + "Policy", ))
                     threadTest.start()
                     accuracy = 100
+                    
+
+
+        print("Complete {0} with {1}% accuracy".format(self.arqName, accuracy))
+        self.onTimePlot(show_result=True)
+        plt.ioff()
+
+        torch.save(self.policy_net.state_dict(), self.arqName + "Policy")
+        torch.save(self.target_net.state_dict(), self.arqName + "Target")
+        
+        if self.env.spec.id == "LunarLander-v2":
+            plt.savefig("results/lunarLander/DDQL.png")
+        elif self.env.spec.id == "CartPole-v1":
+            plt.savefig("results/cartPole/DDQL.png")
+
+        return accuracy
+
+class DoubleDeepQLearningMultiAgent(DoubleDeepQLearning):
+
+
+    def __init__(self, env, neuralNetwork, gamma, epsilon, epsilon_min, epsilon_dec, batch_size, tau, lr, num_episodes, stop, arqName):
+
+        # Turn plt interactive mode on
+        plt.ion()
+
+        self.env = env
+        self.neuralNetwork = neuralNetwork
+        self.gamma = gamma                  # gamma is the discount factor as mentioned in the previous section
+        self.epsilon = epsilon              # epsilon is the starting value of epsilon
+        self.epsilon_min = epsilon_min      # epsilon_min is the final value of epsilon
+        self.epsilon_dec = epsilon_dec      # epsilon_dec controls the rate of exponential decay of epsilon, higher means a slower decay
+        self.batch_size = batch_size        # batch_size is the number of transitions sampled from the replay buffer
+        self.tau = tau                      # tau is the update rate of the target network
+        self.lr = lr                        # lr is the learning rate of the ``AdamW`` optimizer
+        self.num_episodes = num_episodes
+        self.stop = stop
+        self.arqName = arqName
+        self.episode_durations = []
+        self.rewards = []
+        self.steps_done = 0
+
+        # Set the memory
+        self.memory = self.ReplayMemory(10000)
+
+        global DEVICE
+        if torch.cuda.is_available():
+            DEVICE = torch.device("cuda")
+        else:
+            DEVICE = torch.device("cpu")
+
+        self.neuralNetworks = {}
+
+        for agent in env.agents:
+
+            # Get number of actions from gym action space
+            n_actions = self.env.action_space(agent).shape[0]
+
+            # Get the number of state observations
+            observation, reward, termination, truncation, info = self.env.last()
+            n_observations = len(observation)
+
+            # Create the policy neural network
+            policy_net = self.neuralNetwork(n_observations, n_actions).to(DEVICE)
+
+            # Create and copy the target neural network from the policy neural network
+            target_net = self.neuralNetwork(n_observations, n_actions).to(DEVICE)
+            target_net.load_state_dict(policy_net.state_dict())
+
+            # Set the optimizer 
+            optimizer = optim.AdamW(policy_net.parameters(), lr = self.lr, amsgrad=True)
+
+            self.neuralNetworks[agent] = (policy_net, target_net, optimizer)
+
+
+        self.durationMeans = []
+        self.rewardMeans = []
+
+    def select_action(self, state, agent):
+        sample = random.random()
+        eps_threshold = self.epsilon_min + (self.epsilon - self.epsilon_min) * \
+            math.exp(-1. * self.steps_done / self.epsilon_dec)
+        self.steps_done += 1
+
+        # If true returns the neural network response, else random value
+        if sample > eps_threshold:
+            with torch.no_grad():
+                # t.max(1) will return the largest column value of each row.
+                # second column on max result is index of where max element was
+                # found, so we pick action with the larger expected reward.
+                return self.neuralNetworks[agent][0](state).squeeze(0)
+        else:
+            action = numpy.array(self.env.action_space(agent).sample())
+            return torch.tensor(action, device = DEVICE, dtype=torch.long)
+        
+    def optimize_model(self, agent):
+        if len(self.memory) < self.batch_size:
+            return
+        transitions = self.memory.sample(self.batch_size)
+        # Transpose the batch (see https://stackoverflow.com/a/19343/3343043 for
+        # detailed explanation). This converts batch-array of Transitions
+        # to Transition of batch-arrays.
+        batch = TRANSITION(*zip(*transitions))
+
+        # Compute a mask of non-final states and concatenate the batch elements
+        # (a final state would've been the one after which simulation ended)
+        non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
+                                            batch.next_state)), device = DEVICE, dtype=torch.bool)
+        
+        non_final_next_states = torch.cat([torch.tensor(s, device = DEVICE) for s in batch.next_state
+                                                    if s is not None])
+        state_batch = torch.cat(batch.state)
+        action_batch = torch.cat(batch.action)
+        reward_batch = torch.cat(batch.reward)
+
+        # print(torch.reshape(action_batch, (128, 2)))
+        # print(self.neuralNetworks[agent][0](state_batch))
+
+        # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
+        # columns of actions taken. These are the actions which would've been taken
+        # for each batch state according to policy_net
+        state_action_values = self.neuralNetworks[agent][0](state_batch).gather(1, action_batch.type(torch.int64).reshape((self.batch_size, 2)))
+
+        # Compute V(s_{t+1}) for all next states.
+        # Expected values of actions for non_final_next_states are computed based
+        # on the "older" target_net; selecting their best reward with max(1)[0].
+        # This is merged based on the mask, such that we'll have either the expected
+        # state value or 0 in case the state was final.
+        next_state_values = torch.zeros(self.batch_size, device = DEVICE)
+        with torch.no_grad():
+            next_state_values[non_final_mask] = self.neuralNetworks[agent][1](non_final_next_states).max(1)[0]
+        # Compute the expected Q values
+        expected_state_action_values = (next_state_values * self.gamma) + reward_batch
+
+        # Compute Huber loss
+        criterion = nn.SmoothL1Loss()
+        loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
+
+        # Optimize the model
+        self.neuralNetworks[agent][3].zero_grad()
+        loss.backward()
+        # In-place gradient clipping
+        torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), 100)
+        self.neuralNetworks[agent][3].step()
+
+    def train(self):
+
+        if DEVICE == torch.device("cuda"):
+            print("Using GPU!")
+        else:
+            print("Using CPU!")
+
+        threadTest = None
+        goodEpsCount = 0
+        global killSwitch
+
+        for i_episode in range(self.num_episodes):
+            # Initialize the environment and get it's state
+            self.env.reset()
+            
+            rewards = 0
+            done = False
+            
+        
+            #while not done:
+
+            for agent in self.env.agent_iter():
+                state, reward, terminated, truncated, info = self.env.last()
+
+                if terminated or truncated:
+                    done = True
+                    state = None
+
+                else:
+                    state = torch.tensor(state, dtype=torch.float32, device = DEVICE).unsqueeze(0)
+            
+                    action = self.select_action(state, agent)
+
+                    self.env.step(action.tolist())
+
+                    observation, reward, terminated, truncated, info = self.env.last()
+
+                    reward = torch.tensor([reward], device = DEVICE)
+                    
+
+                    # Store the transition in memory
+                    self.memory.push(state, action, observation, reward)
+
+
+                    # Perform one step of the optimization (on the policy network)
+                    #self.optimize_model(agent)
+
+                    # Soft update of the target network's weights
+                    # θ′ ← τ θ + (1 −τ )θ′
+                    target_net_state_dict = self.neuralNetworks[agent][1].state_dict()
+                    policy_net_state_dict = self.neuralNetworks[agent][0].state_dict()
+                    for key in policy_net_state_dict:
+                        target_net_state_dict[key] = policy_net_state_dict[key]*self.tau + target_net_state_dict[key]*(1-self.tau)
+                    self.neuralNetworks[agent][1].load_state_dict(target_net_state_dict)
+
+                    rewards += reward[0].item()
+
+                if done:
+                    self.episode_durations.append(0)
+                    self.rewards.append(rewards)
+                    self.onTimePlot()
+                    print("Done")
+                    break
+
+            # if t + 1 >= 500:
+            #     goodEpsCount += 1
+            # else:
+            #     goodEpsCount = 0
+
+            # if i_episode % 50 == 0:
+            #     torch.save(self.policy_net.state_dict(), str(self.arqName) + "Policy")
+            #     torch.save(self.target_net.state_dict(), str(self.arqName) + "Target")
+            #     if self.env.spec.id == "LunarLander-v2":
+            #         if threadTest is not None:
+            #             if threadTest.is_alive():
+            #                 killSwitch = True
+            #                 threadTest.join()
+            #         threadTest = MemoryThread(target = renderLunarLander, args = (self.neuralNetwork, self.arqName + "Policy", ))
+            #         threadTest.start()
+            #         testTimes = 100
+            #         threads =  100
+            #         _rewards, goodCount = multipleTestLunarLander(testTimes, threads, self.neuralNetwork, self.arqName + "Policy")
+            #         accuracy = goodCount/testTimes * 100
+            #         print("Tested accuracy from {0} is {1}%".format(self.arqName, accuracy))
+            #         if goodCount > int(self.stop * testTimes): break
+
+            #     elif self.env.spec.id == "CartPole-v1":
+            #         if threadTest is not None:
+            #             if threadTest.is_alive():
+            #                 print("Killed")
+            #                 killSwitch = True
+            #                 threadTest.join()
+            #         if goodEpsCount >= self.stop: break
+            #         threadTest = MemoryThread(target = renderCartpole, args = (self.neuralNetwork, self.arqName + "Policy", ))
+            #         threadTest.start()
+            #         accuracy = 100
                     
 
 
